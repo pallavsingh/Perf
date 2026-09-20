@@ -1,0 +1,69 @@
+#!/usr/bin/bpftrace
+
+tracepoint:syscalls:sys_enter_futex
+{
+    $op = args->op & 0x7F;
+
+    if ($op == 0) {
+        @start[tid] = nsecs;
+        @addr[tid]  = (uint64)args->uaddr;
+    }
+}
+
+tracepoint:syscalls:sys_exit_futex
+/@start[tid]/
+{
+    $pid  = pid;
+    $addr = (uint64)@addr[tid];
+
+    // FORCE PURE uint64 math (key fix)
+    $delta = (uint64)(nsecs - @start[tid]);
+
+    // IMPORTANT: avoid mixed-type + operation
+    $prev = (uint64)@wait_total[$pid, $addr];
+
+    @wait_total[$pid, $addr] = $prev + $delta;
+    @wait_count[$pid, $addr] += 1;
+
+    delete(@start[tid]);
+    delete(@addr[tid]);
+}
+
+interval:s:5
+{
+    printf("\n%-6s %-18s %-40s %-12s %-12s %-8s\n",
+        "PID", "MUTEX ADDR", "SYMBOL (SCOPE)", "TOTAL(ms)", "AVG(us)", "COUNT");
+
+    for ($kv : @wait_total) {
+
+        $pid   = $kv.0.0;
+        $addr  = $kv.0.1;
+
+        $total = (uint64)$kv.1;
+        $count = (uint64)@wait_count[$pid, $addr];
+
+        if ($count > 0) {
+
+            $total_ms = $total / 1000000;
+            $avg_us   = ($total / 1000) / $count;
+
+            printf("%-6d %-18p %-40s %-12llu %-12llu %-8llu\n",
+                $pid,
+                $addr,
+                usym((uint64)$addr),
+                $total_ms,
+                $avg_us,
+                $count
+            );
+        }
+    }
+
+    clear(@wait_total);
+    clear(@wait_count);
+}
+
+END
+{
+    clear(@start);
+    clear(@addr);
+}

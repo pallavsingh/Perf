@@ -1,0 +1,67 @@
+#!/usr/bin/bpftrace
+
+tracepoint:syscalls:sys_enter_futex
+{
+    $op = args->op & 0x7F;
+
+    if ($op == 0) {
+        @wait_start[tid] = nsecs;
+        @wait_addr[tid]  = args->uaddr;
+        @wait_stack[tid] = ustack(perf, 10);
+    }
+
+    if ($op == 1) {
+        $addr = args->uaddr;
+        $val  = args->val;
+
+        $stack = ustack(perf, 10);
+
+        // FORCE consistent int64 math
+        @wakers[$addr, comm, $stack] += (int64)$val;
+    }
+}
+
+tracepoint:syscalls:sys_exit_futex
+/@wait_start[tid]/
+{
+    $addr  = @wait_addr[tid];
+    $start = @wait_start[tid];
+
+    // force signed arithmetic
+    $delta = (int64)nsecs - (int64)$start;
+
+    @wait_time_total[$addr] += $delta;
+    @wait_count[$addr] += 1;
+
+    @waiter_details[$addr, comm, @wait_stack[tid]] += 1;
+
+    delete(@wait_start[tid]);
+    delete(@wait_addr[tid]);
+    delete(@wait_stack[tid]);
+}
+
+interval:s:5
+{
+    printf("\n=== FULL CONTENTION GRAPH ===\n");
+
+    printf("\n[1] HOT FUTEXES\n");
+    print(@wait_time_total, 10);
+
+    printf("\n[2] WAITER STACKS\n");
+    print(@waiter_details);
+
+    printf("\n[3] WAKER STACKS\n");
+    print(@wakers);
+
+    clear(@wait_time_total);
+    clear(@wait_count);
+    clear(@wakers);
+    clear(@waiter_details);
+}
+
+END
+{
+    clear(@wait_start);
+    clear(@wait_addr);
+    clear(@wait_stack);
+}
