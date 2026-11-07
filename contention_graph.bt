@@ -1,33 +1,57 @@
 #!/usr/bin/bpftrace
 
+// This aggregates waiting information based on:
+//  1. Futex address.
+//  2. Process/thread command name.
+//  3. Userspace stack.
+
+
 tracepoint:syscalls:sys_enter_futex
 {
+// Futex operations contain additional flags in the higher bits.
+// The mask 0x7F removes the higher flag bits and retains the base operation
     $op = args->op & 0x7F;
 
+// $op == 0: FUTEX_WAIT
+// $op == 1: FUTEX_WAKE
+
+// capturing waiting threads
     if ($op == 0) {
+// Because multiple threads can wait simultaneously. Each thread needs its own start timestamp.
         @wait_start[tid] = nsecs;
         @wait_addr[tid]  = args->uaddr;
+
+// This captures up to 10 userspace stack frames
         @wait_stack[tid] = ustack(perf, 10);
     }
 
+
+// capturing waking threads
     if ($op == 1) {
+// The address identifies which futex the thread is attempting to wake waiters on.
         $addr = args->uaddr;
+
+// For FUTEX_WAKE, this is the maximum number of waiters the kernel should wake
         $val  = args->val;
 
         $stack = ustack(perf, 10);
 
-        // FORCE consistent int64 math
+// Aggregate waking information : Futex address + Process/thread command name + Userspace stack
+// Its value is the accumulated args->val
         @wakers[$addr, comm, $stack] += (int64)$val;
+
     }
 }
 
+
+// script is interested in futex exits corresponding to threads for which it previously captured a wait entry
 tracepoint:syscalls:sys_exit_futex
 /@wait_start[tid]/
 {
+// Retrieve the futex address and start timestamp recorded earlier.
     $addr  = @wait_addr[tid];
     $start = @wait_start[tid];
 
-    // force signed arithmetic
     $delta = (int64)nsecs - (int64)$start;
 
     @wait_time_total[$addr] += $delta;
@@ -35,11 +59,13 @@ tracepoint:syscalls:sys_exit_futex
 
     @waiter_details[$addr, comm, @wait_stack[tid]] += 1;
 
+// clean up per-thread information
     delete(@wait_start[tid]);
     delete(@wait_addr[tid]);
     delete(@wait_stack[tid]);
 }
 
+// Periodic reporting - This executes every five seconds
 interval:s:5
 {
     printf("\n=== FULL CONTENTION GRAPH ===\n");
@@ -59,6 +85,7 @@ interval:s:5
     clear(@waiter_details);
 }
 
+// This Block gets executes when the bpftrace script terminates.
 END
 {
     clear(@wait_start);
